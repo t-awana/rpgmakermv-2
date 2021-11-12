@@ -8,6 +8,7 @@
 // 2019/06/15 Windows7のFirefoxでストリーミングが無効なバグの場合、フォールバック
 // 2019/06/16 暗号化音声ファイル対応
 // 2019/06/16 プツプツ対策
+// 2021/11/13 沫那環の手によって、masterブランチ最新版の修正要素を反映
 //=============================================================================
 
 /*:
@@ -74,7 +75,7 @@
  * @text m4aファイルを消去
  * @desc 次にテストプレイを開始した時、すべてのm4aファイルを削除します。念の為バックアップを取った上でご活用ください。
  * @default false
- *
+ * 
  * @help
  * 音声ストリーミングにより、音声読み込みを高速化します。
  * BGMや効果音などの音声ファイルにoggファイルのみを使用します。
@@ -190,6 +191,8 @@ AudioManager.audioFileExt = function() {
     return '.ogg';
 };
 
+fetch('').catch(_ => window.cordova = window.cordova || true);
+
 if (window.ResourceHandler) {
     ResourceHandler.fetchWithRetry = async function(
         method,
@@ -198,7 +201,17 @@ if (window.ResourceHandler) {
     ) {
         let retry;
         try {
-            const response = await fetch(url, { credentials: 'same-origin' });
+            const response = await (!window.cordova ?
+                fetch(url, { credentials: 'same-origin' }) :
+                new Promise((resolve, reject) => {
+                    const xhr = new XMLHttpRequest();
+                    xhr.responseType = 'blob';
+                    xhr.onload = () => resolve(new Response(xhr.response, { status: xhr.status }));
+                    xhr.onerror = reject;
+                    xhr.open('GET', url);
+                    xhr.send();
+                })
+            );
             if (response.ok) {
                 switch (method) {
                     case 'stream':
@@ -234,7 +247,7 @@ if (window.ResourceHandler) {
                 retry = true;
             }
         } catch (error) {
-            if (Utils.isNwjs()) {
+            if (Utils.isNwjs() || window.cordova) {
                 // local file error
                 retry = false;
             } else {
@@ -261,17 +274,6 @@ if (window.ResourceHandler) {
                     resolve(this.fetchWithRetry(method, url, 0))
                 )
             );
-        }
-    };
-} else {
-    window.ResourceHandler = {
-        async fetchWithRetry(url) {
-            const response = await fetch(url, { credentials: 'same-origin' });
-            if (response.ok) {
-                return response.body.getReader();
-            } else {
-                throw new Error();
-            }
         }
     };
 }
@@ -310,6 +312,24 @@ WebAudio.prototype._load = async function(url) {
     }
 };
 
+WebAudio.prototype._onXhrLoad = function(xhr) {
+    var array = xhr.response;
+    if(Decrypter.hasEncryptedAudio) array = Decrypter.decryptArrayBuffer(array);
+    this._readLoopComments(new Uint8Array(array));
+    WebAudio._context.decodeAudioData(array, function(buffer) {
+        this._buffer = buffer;
+        this._totalTime = buffer.duration;
+        if (this._loopLength > 0 && this._sampleRate > 0) {
+            this._loopStart /= this._sampleRate;
+            this._loopLength /= this._sampleRate;
+        } else {
+            this._loopStart = 0;
+            this._loopLength = this._totalTime;
+        }
+        this._onLoad();
+    }.bind(this));
+};
+
 WebAudio.prototype._loading = async function(reader) {
     try {
         const decode = stbvorbis.decodeStream(result => this._onDecode(result));
@@ -320,7 +340,7 @@ WebAudio.prototype._loading = async function(reader) {
                 return;
             }
             let array = value;
-            if (Decrypter.hasEncryptedAudio) {
+            if ( Decrypter.hasEncryptedAudio) {
                 array = Decrypter.decryptUint8Array(array);
             }
             this._readLoopComments(array);
@@ -367,11 +387,34 @@ WebAudio.prototype._onDecode = function(result) {
     if (result.data[0].length === 0) {
         return;
     }
-    const buffer = WebAudio._context.createBuffer(
-        result.data.length,
-        result.data[0].length,
-        result.sampleRate
-    );
+    let buffer;
+    try {
+        buffer = WebAudio._context.createBuffer(
+            result.data.length,
+            result.data[0].length,
+            result.sampleRate
+        );
+    } catch (error) {
+        if (8000 <= result.sampleRate && result.sampleRate < 22050) {
+            result.sampleRate *= 3;
+            for (let i = 0; i < result.data.length; i++) {
+                const old = result.data[i];
+                result.data[i] = new Float32Array(result.data[i].length * 3);
+                for (let j = 0; j < old.length; j++) {
+                    result.data[i][j * 3] = old[j];
+                    result.data[i][j * 3 + 1] = old[j];
+                    result.data[i][j * 3 + 2] = old[j];
+                }
+            }
+            buffer = WebAudio._context.createBuffer(
+                result.data.length,
+                result.data[0].length,
+                result.sampleRate
+            );
+        } else {
+            throw error;
+        }
+    }
     for (let i = 0; i < result.data.length; i++) {
         if (buffer.copyToChannel) {
             buffer.copyToChannel(result.data[i], i);
@@ -474,7 +517,7 @@ WebAudio.prototype._calcSourceNodeParams = function(chunk) {
         const loopEnd = this._loopStart + this._loopLength;
         if (pos <= chunk.when) {
             when = currentTime + (chunk.when - pos) / this._pitch;
-        } else if (pos <= chunkEnd) {
+            } else if (pos <= (window.AudioContext ? chunkEnd : chunkEnd - 0.0001)) {
             when = currentTime;
             offset = pos - chunk.when;
         } else if (this._loopStart <= pos) {
@@ -505,7 +548,7 @@ WebAudio.prototype._calcSourceNodeParams = function(chunk) {
     } else {
         if (pos <= chunk.when) {
             when = currentTime + (chunk.when - pos) / this._pitch;
-        } else if (pos <= chunkEnd) {
+        } else if (pos <= (window.AudioContext ? chunkEnd : chunkEnd - 0.0001)) {
             when = currentTime;
             offset = pos - chunk.when;
         } else {
@@ -526,7 +569,7 @@ WebAudio.prototype._createSourceNode = function(chunk) {
     }
     const params = this._calcSourceNodeParams(chunk);
     if (!params) {
-        if (!this._reservedSeName && !this._concatMode()) {
+        if (!this._reservedSeName && !this._concatMode() && this._loopLength) {
             this._chunks[this._chunks.indexOf(chunk)] = null;
         }
         return;
@@ -637,6 +680,18 @@ WebAudio.prototype._createConcatBuffer = function() {
         chunk.sourceNode.onended = null;
         chunk.sourceNode.stop();
     });
+};
+
+Html5Audio.setup = function (url) {
+    if (!this._initialized) {
+        this.initialize();
+    }
+    this.clear();
+
+    if(Decrypter.hasEncryptedAudio && this._audioElement.src) {
+        window.URL.revokeObjectURL(this._audioElement.src);
+    }
+        this._url = url;
 };
 
 Decrypter.decryptUint8Array = function(uint8Array) {
